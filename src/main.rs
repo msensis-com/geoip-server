@@ -1,163 +1,104 @@
-use http_body_util::Full;
-use hyper::body::Bytes;
-use hyper::server::conn::http1;
-use hyper::Error;
-use hyper::{service::service_fn, Response};
-use hyper::header::CONTENT_TYPE;
-use hyper::StatusCode;
-use hyper_util::rt::TokioIo;
-use maxminddb::{geoip2, Mmap};
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use maxminddb::{ Mmap, Reader, geoip2 };
+use serde_json::{ Value, json };
+use std::net::{ IpAddr };
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::env;
 use tokio::net::TcpListener;
+use clap::{ Parser };
 
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    #[arg(long)]
+    bind: Option<String>,
 
-fn parse_args() -> Result<(SocketAddr, String), Box<dyn std::error::Error>> {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 3 {
-        
-        eprintln!("Usage: {} <bind ip:port> <mmdb file>", args[0]);
-        std::process::exit(1);
-    }
-
-    let bind_host = &args[1];
-    let addr = bind_host.to_socket_addrs()?.next().ok_or("Invalid bind host")?;
-    let mmdb_file = args[2].clone();
-
-    Ok((addr, mmdb_file))
+    mmdb: PathBuf,
 }
 
-async fn run_server(listener: TcpListener, db: Arc<maxminddb::Reader<Mmap>>) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Listening on http://{}", listener.local_addr()?);
-    loop {
-        let (stream, _) = listener.accept().await?;
-        let io = TokioIo::new(stream);
-        let db = db.clone();
-
-        tokio::spawn(async move {
-            let service = service_fn(move |req| {
-                let db = db.clone();
-                let path = req.uri().path().trim_start_matches('/').to_string();
-
-                async move {
-                    match path.as_str() {
-                        "healthz" => {
-                            handle_healthcheck().await
-                        },
-                        _ => {
-                            handle_request(&path, db).await
-                        }
-                    }
-                }
-            });
-
-            if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
-                println!("Error serving connection: {:?}", err);
-            }
-        });
-    }
-}
-
-async fn handle_healthcheck() -> Result<Response<Full<Bytes>>, Error> {
-    Ok(Response::builder()
-    .status(StatusCode::OK)
-    .body(Full::new(Bytes::from("{\"status\": \"healthy\"}"))).unwrap())
-}
-
-async fn handle_request(path: &str, db: Arc<maxminddb::Reader<Mmap>>) -> Result<Response<Full<Bytes>>, Error> {
-    let mut body: Full<Bytes>;
-    let mut status: StatusCode;
-
-    if let Ok(ipaddr) = path.parse::<IpAddr>() {
-        match db.lookup::<geoip2::City>(ipaddr) {
-            Ok(lookup) => {
-                match lookup {
-                    Some(_) => {
-                        status = StatusCode::OK;
-                        body = Full::new(Bytes::from(
-                            serde_json::to_string(&lookup).unwrap().to_string(),
-                        ));
-                    },
-                    None => {
-                        status = StatusCode::NOT_FOUND;
-                        body = Full::new(Bytes::from("{\"error\": \"not_found\"}"));
-                    }
-                }
-                if lookup.is_none() {
-                    status = StatusCode::NOT_FOUND;
-                    body = Full::new(Bytes::from("{\"error\": \"not_found\"}"));
-                }
-            },
-            Err(_) => {
-                status = StatusCode::INTERNAL_SERVER_ERROR;
-                body = Full::new(Bytes::from("{\"error\": \"internal_error\"}"));
-            }
-        }
-    } else {
-        status = StatusCode::BAD_REQUEST;
-        body = Full::new(Bytes::from("{\"error\": \"invalid_ip\"}"))
-    }
-
-    Ok::<_, Error>(Response::builder()
-    .header(CONTENT_TYPE, "application/json")
-    .status(status)
-    .body(body).unwrap())
-}
+use axum::{ extract::{ Path, State }, http::StatusCode, routing::{ get }, Json, Router };
+use tracing_subscriber::{ layer::SubscriberExt, util::SubscriberInitExt };
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (addr, mmdb_file) = parse_args()?;
+async fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
 
-    let listener = TcpListener::bind(addr).await?;
+    tracing_subscriber
+        ::registry()
+        .with(
+            tracing_subscriber::EnvFilter
+                ::try_from_default_env()
+                .unwrap_or_else(|_| format!("{}=debug", env!("CARGO_CRATE_NAME")).into())
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
 
-    let db = Arc::new(maxminddb::Reader::open_mmap(mmdb_file)?);
+    let db = Arc::new(maxminddb::Reader::open_mmap(args.mmdb)?);
 
-    run_server(listener, db).await?;
+    let app = Router::new()
+        .route("/{ip}", get(resolve_ip::<GeoIpRepository>))
+        .with_state(AppState { geo: GeoIpRepository { db } });
+
+    let bind = args.bind.unwrap_or("127.0.0.1:3000".to_string());
+    let listener = TcpListener::bind(bind).await.unwrap();
+
+    tracing::debug!("listening on {}", listener.local_addr().unwrap());
+    axum::serve(listener, app).await.unwrap();
 
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use http_body_util::BodyExt;
-    use tokio_test::assert_ok;
+#[derive(Clone)]
+struct AppState {
+    geo: GeoIpRepository,
+}
 
-    async fn mock_handle_request(ip: &str) -> Result<Response<Full<Bytes>>, Error> {
-        let db = Arc::new(maxminddb::Reader::open_mmap("MaxMind-DB/test-data/GeoIP2-City-Test.mmdb").unwrap());
-        handle_request(ip, db).await
-    }
+async fn resolve_ip<T>(
+    State(state): State<AppState>,
+    Path(ip): Path<String>
+) -> Result<Json<Value>, StatusCode>
+    where T: GeoIpRepo
+{
+    let Ok(country) = state.geo.resolve_ip(ip) else {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
 
-    #[tokio::test]
-    async fn test_handle_request_with_valid_ip() {
-        let ip = "89.160.20.128";
-        let response = mock_handle_request(ip).await;
-        assert_ok!(&response);
-        let mut data = response.unwrap();
-        assert_eq!(data.headers().get(CONTENT_TYPE).unwrap(), "application/json");
-        assert_eq!(data.status(), StatusCode::OK);
-        let body = data.frame().await.unwrap().unwrap().into_data().unwrap();
-        let json = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
-        assert_eq!(json["city"]["names"]["en"], "Linköping");
-    }
+    Ok(Json(country))
+}
 
-    #[tokio::test]
-    async fn test_handle_request_with_unknown_ip() {
-        let ip = "192.168.0.1";
-        let response = mock_handle_request(ip).await;
-        assert_ok!(&response);
-        let data = response.unwrap();
-        assert_eq!(data.headers().get(CONTENT_TYPE).unwrap(), "application/json");
-        assert_eq!(data.status(), StatusCode::NOT_FOUND);
-    }
+trait GeoIpRepo: Send + Sync {
+    fn resolve_ip(&self, ip: String) -> anyhow::Result<Value>;
+}
 
-    #[tokio::test]
-    async fn test_handle_request_with_invalid_ip() {
-        let ip = "invalid-ip";
-        let response = mock_handle_request(ip).await;
-        assert_ok!(&response);
-        let data = response.unwrap();
-        assert_eq!(data.status(), StatusCode::BAD_REQUEST);
+#[derive(Clone)]
+struct GeoIpRepository {
+    db: Arc<Reader<Mmap>>,
+}
+
+impl GeoIpRepo for GeoIpRepository {
+    fn resolve_ip(&self, ip: String) -> anyhow::Result<Value> {
+        let ip: IpAddr = ip.parse()?;
+        let db = self.db.clone();
+
+        let Some(country) = db.lookup::<geoip2::Country>(ip)? else {
+            return Ok(json!({}));
+        };
+
+        let mut continent_code = "";
+        if let Some(continent) = country.continent {
+            continent_code = continent.code.unwrap();
+        }
+
+        let mut country_code = "";
+        if let Some(country) = country.country {
+            country_code = country.iso_code.unwrap();
+        }
+
+        Ok(
+            json!({
+            "country": country_code,
+            "continent": continent_code
+        })
+        )
     }
 }
