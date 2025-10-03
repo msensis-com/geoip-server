@@ -1,5 +1,4 @@
-# geoip-server
-[![Build](https://github.com/tpyo/geoip-server/actions/workflows/build.yml/badge.svg)](https://github.com/tpyo/geoip-server/actions/workflows/build.yml)
+# geoip-server (fork)
 
 Fast, lightweight MaxMind GeoIP lookup server written in Rust
 

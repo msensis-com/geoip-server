@@ -10,4 +10,3 @@ FROM scratch
 COPY --from=builder /build/target/release/geoip-server /
 COPY --from=builder /build/*.mmdb /
 CMD ["/geoip-server"]
-

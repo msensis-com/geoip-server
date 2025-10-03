@@ -8,12 +8,24 @@ edition = "2021"
 
 [dependencies]
 http-body-util = "0.1.2"
-hyper = { version = "1.6.0", default-features = false, features = ["http1", "http2", "server"] }
-hyper-util = { version = "0.1.10", default-features = false, features = ["http1", "http2", "tokio"] }
 maxminddb = { version = "0.26.0", features = ["mmap"] }
 serde = "1.0.217"
 serde_json = "1.0.138"
-tokio = { version = "1.43.0", default-features = false, features = ["rt", "rt-multi-thread", "macros"] }
+
+[dependencies.tokio]
+version = "1.43.0"
+default-features = false
+features = ["net", "rt", "rt-multi-thread", "macros"]
+
+[dependencies.hyper]
+version = "1.6.0"
+default-features = false
+features = ["http1", "http2", "server"]
+
+[dependencies.hyper-util]
+version = "0.1.10"
+default-features = false
+features = ["http1", "http2", "server"]
 
 [dev-dependencies]
 tokio-test = "0.4.3"
