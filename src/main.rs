@@ -1,3 +1,4 @@
+use anyhow::Context;
 use maxminddb::{ Mmap, Reader, geoip2 };
 use serde_json::{ Value, json };
 use std::net::{ IpAddr };
@@ -84,21 +85,15 @@ impl GeoIpRepo for GeoIpRepository {
             return Ok(json!({}));
         };
 
-        let mut continent_code = "";
-        if let Some(continent) = country.continent {
-            continent_code = continent.code.unwrap();
-        }
-
-        let mut country_code = "";
-        if let Some(country) = country.country {
-            country_code = country.iso_code.unwrap();
-        }
+        let continent = country.continent.context("country")?;
+        let country = country.country.context("continent")?;
 
         Ok(
             json!({
-            "country": country_code,
-            "continent": continent_code
-        })
+                "country": country.names.context("country")?.get("en").context("country name")?,
+                "country_code": country.iso_code.context("country code")?,
+                "continent": continent.names.context("continent")?.get("en").context("continent name")?
+            })
         )
     }
 }
